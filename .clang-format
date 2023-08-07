@@ -1,0 +1,15 @@
+BasedOnStyle: LLVM
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex:           '^<'
+    Priority:        6
+  - Regex:           '^<(llvm|llvm-c)/'
+    Priority:        5
+  - Regex:           '^<(clang|clang-c)/'
+    Priority:        4
+  - Regex:           '^<(mlir|mlir-c)/'
+    Priority:        3
+  - Regex:           '^"\.\./'
+    Priority:        2
+  - Regex:           '.*'
+    Priority:        1
