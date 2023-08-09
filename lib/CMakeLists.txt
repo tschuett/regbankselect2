@@ -1,5 +1,5 @@
 add_library(regbankselect
-           AArch64RegisterBankInfoV2.cpp
+           AArch64RegBankSelect.cpp
            )
 
 
