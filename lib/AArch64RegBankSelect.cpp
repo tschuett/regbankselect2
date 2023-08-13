@@ -1,5 +1,4 @@
-//==- llvm/Target/AArch64/GISel/AArch64RegBankSelect.cpp - AArch64RegBankSelect
-//--*- C++ -*-==//
+//===- AArch64RegBankSelect.cpp --------------------------------------------==//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -10,31 +9,269 @@
 /// This file implements the AArch64RegBankSelect class.
 //===----------------------------------------------------------------------===//
 
-#include "AArch64RegBankSelect.h"
 // #include "AArch64RegisterBankInfo.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/CodeGen/GlobalISel/GenericMachineInstrs.h"
+#include "llvm/CodeGen/GlobalISel/RegBankSelect.h"
 #include "llvm/CodeGen/GlobalISel/Utils.h"
 #include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/Register.h"
 #include "llvm/CodeGen/RegisterBankInfo.h"
-#include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicsAArch64.h"
-#include "llvm/Support/raw_ostream.h"
+#include <array>
+#include <optional>
 
 using namespace llvm;
 
 #define DEBUG_TYPE "aarch64-regbank-select"
 
-/* GenericOpcodes.td on Juli 31 2023
+/// The AArch64 register bank kinds. Uncertainty is modelled with Or.
+enum RegisterBankKind {
+  /// R0 - R15
+  GPR,
+  /// D0 - D31
+  FPR,
+  /// R or D registers
+  GPROrFPR,
+  /// Z0 - Z31
+  SVEData,
+  /// P0 - P15
+  SVEPredicate,
+  /// ZA*
+  SME
+};
+
+/// Algorithm
+///
+/// 1. Categorize llvm::MachineInstr in #RegisterBankKind as complete and
+/// precise as possible. Uncertainty is modelled with Or.
+/// 2. Assign register banks for unambiguous llvm::MachineInstr.
+/// 3. Use assigned register banks to assign ambiguous llvm::MachineInstr to
+/// register banks.
+///
+/// Claim: In the third step, there are only a few MIs and a lot of assigned
+/// register banks.
+///
+/// No recursion.
+///
+/// The most important methods are
+/// AArch64RegBankSelect::assignAmbiguousRegisterBank,
+/// AArch64RegBankSelect::classifyDef and
+/// AArch64RegBankSelect::classifyMemoryDef.
+
+/* GenericOpcodes.td on August 9 2023
  * Please extend.
+ *
+ * Some Opcodes are ignored, e.g., G_JUMP_TABLE, G_STACKSAVE, G_STACKRESTORE, ..
  */
+
+namespace {
+
+class AArch64RegBankSelect : public llvm::RegBankSelect {
+  /// classifiers
+  RegisterBankKind classifyDef(const llvm::MachineInstr &) const;
+  RegisterBankKind classifyMemoryDef(const llvm::MachineInstr &MI) const;
+  RegisterBankKind classifyAtomicDef(const llvm::MachineInstr &MI) const;
+  RegisterBankKind classifyIntrinsicDef(const llvm::MachineInstr &MI) const;
+  RegisterBankKind getDefRegisterBank(const llvm::MachineInstr &MI) const;
+  RegisterBankKind classifyExtract(const llvm::MachineInstr &MI) const;
+  /// Classify G_BUILD_VECTOR.
+  RegisterBankKind classifyBuildVector(const llvm::MachineInstr &MI) const;
+
+  /// predicates
+  bool isDomainReassignable(const llvm::MachineInstr &) const;
+  bool usesFPR(const llvm::MachineInstr &) const;
+  bool defsFPR(const llvm::MachineInstr &) const;
+  bool usesGPR(const llvm::MachineInstr &) const;
+  bool defsGPR(const llvm::MachineInstr &) const;
+  bool isUnambiguous(const llvm::MachineInstr &) const;
+  bool isAmbiguous(const llvm::MachineInstr &) const;
+  bool isFloatingPoint(const llvm::MachineInstr &) const;
+  bool usesFRPRegisterBank(const llvm::MachineInstr &MI) const;
+  bool isUnassignable(const MachineInstr &MI) const;
+
+  /// assign MIs to register banks
+  void assignAmbiguousRegisterBank(const llvm::MachineInstr &);
+  void assignUnambiguousRegisterBank(const llvm::MachineInstr &);
+  void assignFPR(const llvm::MachineInstr &MI);
+  void assignGPR(const llvm::MachineInstr &MI);
+
+public:
+  static char ID;
+
+  AArch64RegBankSelect();
+
+  bool runOnMachineFunction(llvm::MachineFunction &MF) override;
+
+  llvm::StringRef getPassName() const override {
+    return "AArch64RegBankSelect";
+  }
+
+  llvm::MachineFunctionProperties getRequiredProperties() const override {
+    return llvm::MachineFunctionProperties()
+        .set(llvm::MachineFunctionProperties::Property::IsSSA)
+        .set(llvm::MachineFunctionProperties::Property::Legalized);
+  }
+
+private:
+  /// Current optimization remark emitter. Used to report failures.
+  std::unique_ptr<llvm::MachineOptimizationRemarkEmitter> MORE;
+};
+
+struct UseDefBehavior {
+  unsigned Opcode;
+  bool uses;
+  bool defs;
+};
+
+} // namespace
+
+// FIXME: sort?
+
+/// List of floating point instructions with their use/def behavior.
+static constexpr std::array<UseDefBehavior, 20> FloatingPoint = {
+    {TargetOpcode::G_FCMP, true, true}, // maybe
+    {TargetOpcode::G_LROUND, true, false},
+    {TargetOpcode::G_LLROUND, true, false},
+    {TargetOpcode::G_STRICT_FADD, true, true},
+    {TargetOpcode::G_STRICT_FSUB, true, true},
+    {TargetOpcode::G_STRICT_FMUL, true, true},
+    {TargetOpcode::G_STRICT_FDIV, true, true},
+    {TargetOpcode::G_STRICT_FREM, true, true},
+    {TargetOpcode::G_STRICT_FMA, true, true},
+    {TargetOpcode::G_STRICT_FSQRT, true, true},
+    {TargetOpcode::G_STRICT_FLDEXP, true, true},
+    {TargetOpcode::G_FPTOSI, true, false},
+    {TargetOpcode::G_FPTOUI, true, false},
+    {TargetOpcode::G_SITOFP, false, true},
+    {TargetOpcode::G_UITOFP, false, true},
+    {TargetOpcode::G_FPEXT, true, true},
+    {TargetOpcode::G_FPTRUNC, true, true},
+    {TargetOpcode::G_FABS, true, true},
+    {TargetOpcode::G_FCOPYSIGN, true, true},
+    {TargetOpcode::G_FCANONICALIZE, true, true},
+    {TargetOpcode::G_IS_FPCLASS, true, true},
+    {TargetOpcode::G_FMINNUM, true, true},
+    {TargetOpcode::G_FMAXNUM, true, true},
+    {TargetOpcode::G_FMINNUM_IEEE, true, true},
+    {TargetOpcode::G_FMAXNUM_IEEE, true, true},
+    {TargetOpcode::G_FMINIMUM, true, true},
+    {TargetOpcode::G_FMAXIMUM, true, true},
+    {TargetOpcode::G_FADD, true, true},
+    {TargetOpcode::G_FSUB, true, true},
+    {TargetOpcode::G_FMUL, true, true},
+    {TargetOpcode::G_FMA, true, true},
+    {TargetOpcode::G_FMAD, true, true},
+    {TargetOpcode::G_FDIV, true, true},
+    {TargetOpcode::G_FREM, true, true},
+    {TargetOpcode::G_FPOW, true, true},
+    {TargetOpcode::G_FPOWI, true, true},
+    {TargetOpcode::G_FEXP, true, true},
+    {TargetOpcode::G_FEXP2, true, true},
+    {TargetOpcode::G_FLOG, true, true},
+    {TargetOpcode::G_FLOG2, true, true},
+    {TargetOpcode::G_FLOG10, true, true},
+    {TargetOpcode::G_FLDEXP, true, true},
+    {TargetOpcode::G_FFREXP, true, true},
+    {TargetOpcode::G_FCEIL, true, true},
+    {TargetOpcode::G_FCOS, true, true},
+    {TargetOpcode::G_FSIN, true, true},
+    {TargetOpcode::G_FSQRT, true, true},
+    {TargetOpcode::G_FFLOOR, true, true},
+    {TargetOpcode::G_FRINT, true, true},
+    {TargetOpcode::G_FNEARBYINT, true, true},
+    {TargetOpcode::G_VECREDUCE_SEQ_FADD, true, true},
+    {TargetOpcode::G_VECREDUCE_SEQ_FMUL, true, true},
+    {TargetOpcode::G_VECREDUCE_FADD, true, true},
+    {TargetOpcode::G_VECREDUCE_FMUL, true, true},
+    {TargetOpcode::G_VECREDUCE_FMAX, true, true},
+    {TargetOpcode::G_VECREDUCE_FMIN, true, true},
+    {TargetOpcode::G_VECREDUCE_ADD, true, true},
+    {TargetOpcode::G_VECREDUCE_MUL, true, true},
+    {TargetOpcode::G_VECREDUCE_AND, true, true},
+    {TargetOpcode::G_VECREDUCE_OR, true, true},
+    {TargetOpcode::G_VECREDUCE_XOR, true, true},
+    {TargetOpcode::G_VECREDUCE_SMAX, true, true},
+    {TargetOpcode::G_VECREDUCE_SMIN, true, true},
+    {TargetOpcode::G_VECREDUCE_UMAX, true, true},
+    {TargetOpcode::G_VECREDUCE_FMAXIMUM, true, true},
+    {TargetOpcode::G_VECREDUCE_FMINIMUM, true, true},
+    {TargetOpcode::G_VECREDUCE_UMIN, true, true},
+    {TargetOpcode::G_FCONSTANT, false, true},
+    {TargetOpcode::G_INTRINSIC_TRUNC, true, true},
+    {TargetOpcode::G_INTRINSIC_ROUND, true, true},
+    {TargetOpcode::G_INTRINSIC_ROUNDEVEN, true, true},
+    {AArch64::G_DUP, true, true}};
+
+/// List of integer/GPR instructions with their use/def behavior.
+static constexpr std::array<UseDefBehavior, 20> Integer = {
+    {TargetOpcode::G_PTRMASK, true, true},
+    {TargetOpcode::G_SDIV, true, true},
+    {TargetOpcode::G_UDIV, true, true},
+    {TargetOpcode::G_SMULO, true, true},
+    {TargetOpcode::G_UMULO, true, true},
+    {TargetOpcode::G_SADDE, true, true},
+    {TargetOpcode::G_SSUBE, true, true},
+    {TargetOpcode::G_UADDE, true, true},
+    {TargetOpcode::G_USUBE, true, true},
+    {TargetOpcode::G_SADDO, true, true},
+    {TargetOpcode::G_SSUBO, true, true},
+    {TargetOpcode::G_UADDO, true, true},
+    {TargetOpcode::G_USUBO, true, true},
+    {TargetOpcode::G_FREM, true, true},
+    {TargetOpcode::G_CONSTANT, true, true},
+    {TargetOpcode::G_SEXT_INREG, true, true},
+    {TargetOpcode::G_BRCOND, true, true},
+    {TargetOpcode::G_FRAME_INDEX, true, true},
+    {TargetOpcode::G_VASTART, true, true},
+    {TargetOpcode::G_ATOMIC_CMPXCHG_WITH_SUCCESS, true, true},
+    {TargetOpcode::G_ATOMIC_CMPXCHG, true, true},
+    {TargetOpcode::G_ATOMICRMW_XCHG, true, true},
+    {TargetOpcode::G_ATOMICRMW_ADD, true, true},
+    {TargetOpcode::G_ATOMICRMW_SUB, true, true},
+    {TargetOpcode::G_ATOMICRMW_AND, true, true},
+    {TargetOpcode::G_ATOMICRMW_OR, true, true},
+    {TargetOpcode::G_ATOMICRMW_XOR, true, true},
+    {TargetOpcode::G_ATOMICRMW_MIN, true, true},
+    {TargetOpcode::G_ATOMICRMW_MAX, true, true},
+    {TargetOpcode::G_ATOMICRMW_UMIN, true, true},
+    {TargetOpcode::G_ATOMICRMW_UMAX, true, true},
+    {TargetOpcode::G_BLOCK_ADDR, true, true},
+    {TargetOpcode::G_JUMP_TABLE, true, true},
+    {TargetOpcode::G_BRJT, true, true},
+    {TargetOpcode::G_ROTR, true, true},
+    {TargetOpcode::G_ROTL, true, true},
+    {TargetOpcode::G_SBFX, true, true},
+    {TargetOpcode::G_UBFX, true, true},
+    {TargetOpcode::G_SADDSAT, true, true},
+    {TargetOpcode::G_SSUBSAT, true, true},
+    {TargetOpcode::G_LROUND, false, true},
+    {TargetOpcode::G_LLROUND, false, true}};
+
+static std::optional<UseDefBehavior> findFloat(unsigned Opcode) {
+  // FIXME slow:
+  for (auto FloatOp : FloatingPoint)
+    if (FloatOp.Opcode == Opcode)
+      return FloatOp;
+  return std::nullopt;
+}
+
+static std::optional<UseDefBehavior> findGPR(unsigned Opcode) {
+  // FIXME slow:
+  for (auto GPROp : Integer)
+    if (GPROp.Opcode == Opcode)
+      return GPROp;
+  return std::nullopt;
+}
 
 AArch64RegBankSelect::AArch64RegBankSelect()
     : RegBankSelect(AArch64RegBankSelect::ID, Mode::Fast) {}
 
 char AArch64RegBankSelect::ID = 0;
 
+/// Returns true when \p MI uses the FPR register bank.
 bool AArch64RegBankSelect::usesFRPRegisterBank(
     const llvm::MachineInstr &MI) const {
   const MachineFunction &MF = *MI.getParent()->getParent();
@@ -49,7 +286,67 @@ bool AArch64RegBankSelect::usesFRPRegisterBank(
   return false;
 }
 
+bool AArch64RegBankSelect::usesGPR(const llvm::MachineInstr &MI) const {
+  if (auto useDef = findGPR(MI.getOpcode()))
+    return useDef->uses;
+  return false;
+}
+
+bool AArch64RegBankSelect::defsGPR(const llvm::MachineInstr &MI) const {
+  if (auto useDef = findGPR(MI.getOpcode()))
+    return useDef->defs;
+  return false;
+}
+
+RegisterBankKind
+AArch64RegBankSelect::classifyExtract(const llvm::MachineInstr &MI) const {
+  const MachineFunction &MF = *MI.getParent()->getParent();
+  const MachineRegisterInfo &MRI = MF.getRegInfo();
+
+  // For 128 bit sources we have to use FPR unless proven otherwise
+  Register Src = MI.getOperand(1).getReg();
+  LLT SrcTy = MRI.getType(MI.getOperand(1).getReg());
+  if (SrcTy.getSizeInBits() == 128)
+    return RegisterBankKind::FPR;
+  if (MRI.getRegClassOrNull(Src) == &AArch64::XSeqPAirsClassRegClass)
+    return RegisterBankKind::GPR;
+  return RegisterBankKind::FPR;
+}
+
+RegisterBankKind
+AArch64RegBankSelect::classifyBuildVector(const llvm::MachineInstr &MI) const {
+  const MachineFunction &MF = *MI.getParent()->getParent();
+  const MachineRegisterInfo &MRI = MF.getRegInfo();
+  Register Src = MI.getOperand(1).getReg();
+
+  if (MRI.getRegClassOrNull(Src) != &AArch64::PMI_FirstGPR)
+    return RegisterBankKind::FPR;
+
+  Register VReg = MI.getOperand(1).getReg();
+  if (!VReg)
+    return RegisterBankKind::GPR; // FIXME
+
+  MachineInstr *DefMI = MRI.getVRegDef(VReg);
+  unsigned DefOpc = DefMI->getOpcode();
+  LLT SrcTy = MRI.getType(VReg);
+  if (all_of(MI.operands(), [&](const MachineOperand &Op) {
+        return Op.isDef() || MRI.getVRegDef(Op.getReg())->getOpcode() ==
+                                 TargetOpcode::G_CONSTANT;
+      })) {
+    return RegisterBankKind::GPR;
+  }
+
+  if (isFloatingPoint(*DefMI) || SrcTy.getSizeInBits() < 32 ||
+      getRegBank(VReg, MRI, TRI) == &AArch64::FPRRegBank) {
+    return RegisterBankKind::FPR;
+  }
+
+  return RegisterBankKind::FPR; // FIXME
+}
+
 // FIXME: refine
+
+/// Classify load or store instruction \p MI.
 RegisterBankKind
 AArch64RegBankSelect::classifyMemoryDef(const llvm::MachineInstr &MI) const {
   const MachineFunction &MF = *MI.getParent()->getParent();
@@ -61,21 +358,66 @@ AArch64RegBankSelect::classifyMemoryDef(const llvm::MachineInstr &MI) const {
   if (Size > 64)
     return RegisterBankKind::FPR;
 
-  // Check if that load feeds fp instructions.
-  // In that case, we want the default mapping to be on FPR
-  // instead of blind map every scalar to GPR.
-  if (any_of(MRI.use_nodbg_instructions(MI.getOperand(0).getReg()),
-             [&](const MachineInstr &UseMI) {
-               // If we have at least one direct use in a FP instruction,
-               // assume this was a floating point load in the IR. If it was
-               // not, we would have had a bitcast before reaching that
-               // instruction.
-               //
-               // Int->FP conversion operations are also captured in
-               // onlyDefinesFP().
-               return usesFPR(UseMI) || defsFPR(UseMI);
-             }))
+  if (auto *LdSt = dyn_cast<GLoadStore>(&MI)) {
+    if (LdSt->isAtomic())
+      return RegisterBankKind::GPR;
+    LdSt->getMMO().getAlign();
+  }
+
+  if (auto *Ld = dyn_cast<GLoad>(&MI)) {
+    // Try to guess the type of the Load/Store.
+    const auto &MMO = **MI.memoperands_begin();
+    const Value *LdVal = MMO.getValue();
+    if (LdVal) {
+      Type *EltTy = nullptr;
+      if (const GlobalValue *GV = dyn_cast<GlobalValue>(LdVal)) {
+        EltTy = GV->getValueType();
+      } else {
+        for (const auto *LdUser : LdVal->users()) {
+          if (isa<LoadInst>(LdUser)) {
+            EltTy = LdUser->getType();
+            break;
+          }
+          if (isa<StoreInst>(LdUser) && LdUser->getOperand(1) == LdVal) {
+            EltTy = LdUser->getType();
+            break;
+          }
+        }
+      }
+      if (EltTy && EltTy->isFPOrFPVectorTy())
+        return RegisterBankKind::FPR;
+    }
+
+    // Check if that load feeds fp instructions.
+    // In that case, we want the default mapping to be on FPR
+    // instead of blind map every scalar to GPR.
+    if (any_of(MRI.use_nodbg_instructions(MI.getOperand(0).getReg()),
+               [&](const MachineInstr &UseMI) {
+                 // If we have at least one direct use in a FP instruction,
+                 // assume this was a floating point load in the IR. If it was
+                 // not, we would have had a bitcast before reaching that
+                 // instruction.
+                 //
+                 // Int->FP conversion operations are also captured in;
+                 // defsFPR().
+                 return usesFPR(UseMI) || defsFPR(UseMI);
+               }))
+      return RegisterBankKind::FPR;
+
+    if (any_of(MRI.use_nodbg_instructions(MI.getOperand(0).getReg()),
+               [&](const MachineInstr &UseMI) {
+                 return usesGPR(UseMI) || defsGPR(UseMI);
+               }))
+      return RegisterBankKind::GPR;
+  }
+
+  if (auto *St = dyn_cast<GStore>(&MI)) {
+    Register Dst = MI.getOperand(0).getReg();
+
+    if (MRI.getRegClassOrNull(Dst) == &AArch64::PMI_FirstGPR) {
+    }
     return RegisterBankKind::FPR;
+  }
 
   // last resort: unknown
   return RegisterBankKind::GPROrFPR;
@@ -89,76 +431,17 @@ AArch64RegBankSelect::classifyAtomicDef(const llvm::MachineInstr &MI) const {
 
 RegisterBankKind
 AArch64RegBankSelect::classifyIntrinsicDef(const llvm::MachineInstr &MI) const {
+  if (!isFloatingPoint(MI))
+    return RegisterBankKind::GPR;
+
+  return RegisterBankKind::FPR;
 }
 
 /// Returns whether instr \p MI is a  floating-point,
 /// having only floating-point operands.
 bool AArch64RegBankSelect::isFloatingPoint(const llvm::MachineInstr &MI) const {
-  switch (MI.getOpcode()) {
-  case TargetOpcode::G_STRICT_FADD:
-  case TargetOpcode::G_STRICT_FSUB:
-  case TargetOpcode::G_STRICT_FMUL:
-  case TargetOpcode::G_STRICT_FDIV:
-  case TargetOpcode::G_STRICT_FREM:
-  case TargetOpcode::G_STRICT_FMA:
-  case TargetOpcode::G_STRICT_FSQRT:
-  case TargetOpcode::G_STRICT_FLDEXP:
-  case TargetOpcode::G_FPEXT:
-  case TargetOpcode::G_FPTRUNC:
-  case TargetOpcode::G_FABS:
-  case TargetOpcode::G_FCOPYSIGN:
-  case TargetOpcode::G_FCANONICALIZE:
-  case TargetOpcode::G_IS_FPCLASS:
-  case TargetOpcode::G_FMINNUM:
-  case TargetOpcode::G_FMAXNUM:
-  case TargetOpcode::G_FMINNUM_IEEE:
-  case TargetOpcode::G_FMAXNUM_IEEE:
-  case TargetOpcode::G_FMINIMUM:
-  case TargetOpcode::G_FMAXIMUM:
-  case TargetOpcode::G_FADD:
-  case TargetOpcode::G_FSUB:
-  case TargetOpcode::G_FMUL:
-  case TargetOpcode::G_FMA:
-  case TargetOpcode::G_FMAD:
-  case TargetOpcode::G_FDIV:
-  case TargetOpcode::G_FREM:
-  case TargetOpcode::G_FPOW:
-  case TargetOpcode::G_FPOWI:
-  case TargetOpcode::G_FEXP:
-  case TargetOpcode::G_FEXP2:
-  case TargetOpcode::G_FLOG:
-  case TargetOpcode::G_FLOG2:
-  case TargetOpcode::G_FLOG10:
-  case TargetOpcode::G_FLDEXP:
-  case TargetOpcode::G_FFREXP:
-  case TargetOpcode::G_FCEIL:
-  case TargetOpcode::G_FCOS:
-  case TargetOpcode::G_FSIN:
-  case TargetOpcode::G_FSQRT:
-  case TargetOpcode::G_FFLOOR:
-  case TargetOpcode::G_FRINT:
-  case TargetOpcode::G_FNEARBYINT:
-  case TargetOpcode::G_VECREDUCE_SEQ_FADD:
-  case TargetOpcode::G_VECREDUCE_SEQ_FMUL:
-  case TargetOpcode::G_VECREDUCE_FADD:
-  case TargetOpcode::G_VECREDUCE_FMUL:
-  case TargetOpcode::G_VECREDUCE_FMAX:
-  case TargetOpcode::G_VECREDUCE_FMIN:
-  case TargetOpcode::G_VECREDUCE_ADD:
-  case TargetOpcode::G_VECREDUCE_MUL:
-  case TargetOpcode::G_VECREDUCE_AND:
-  case TargetOpcode::G_VECREDUCE_OR:
-  case TargetOpcode::G_VECREDUCE_XOR:
-  case TargetOpcode::G_VECREDUCE_SMAX:
-  case TargetOpcode::G_VECREDUCE_SMIN:
-  case TargetOpcode::G_VECREDUCE_UMAX:
-  case TargetOpcode::G_VECREDUCE_UMIN:
-  case TargetOpcode::G_INTRINSIC_TRUNC:
-  case TargetOpcode::G_INTRINSIC_ROUND:
-  case TargetOpcode::G_VECREDUCE_FMAXIMUM:
-  case TargetOpcode::G_VECREDUCE_FMINIMUM:
-    return true;
-  }
+  if (auto FloatOp = findFloat(MI.getOpcode()))
+    return FloatOp->uses && FloatOp->defs;
   return false;
 }
 
@@ -177,6 +460,7 @@ AArch64RegBankSelect::getDefRegisterBank(const llvm::MachineInstr &MI) const {
   return RegisterBankKind::GPR;
 }
 
+/// Assing \p MI to the FPR register bank
 void AArch64RegBankSelect::assignFPR(const llvm::MachineInstr &MI) {
   const MachineFunction &MF = *MI.getParent()->getParent();
   const MachineRegisterInfo &MRI = MF.getRegInfo();
@@ -184,6 +468,7 @@ void AArch64RegBankSelect::assignFPR(const llvm::MachineInstr &MI) {
   MRI.setRegBank(MI.getOperand(0).getReg(), AArch64::FPRRegBank);
 }
 
+/// Assing \p MI to the GPR register bank
 void AArch64RegBankSelect::assignGPR(const llvm::MachineInstr &MI) {
   const MachineFunction &MF = *MI.getParent()->getParent();
   const MachineRegisterInfo &MRI = MF.getRegInfo();
@@ -205,6 +490,7 @@ void AArch64RegBankSelect::assignUnambiguousRegisterBank(
   }
 }
 
+/// Assign ambiguous \p MI to a register bank. It uses heuristics.
 void AArch64RegBankSelect::assignAmbiguousRegisterBank(
     const llvm::MachineInstr &MI) {
   const MachineRegisterInfo &MRI = MI.getMF()->getRegInfo();
@@ -231,6 +517,9 @@ bool AArch64RegBankSelect::isUnambiguous(const llvm::MachineInstr &mi) const {
 }
 
 // FIXME: improve
+
+/// Categorizes \p MI in RegisterBankKind. It is the main
+/// classifier. The goals are coverage and precision.
 RegisterBankKind
 AArch64RegBankSelect::classifyDef(const llvm::MachineInstr &MI) const {
   const MachineFunction &MF = *MI.getParent()->getParent();
@@ -254,14 +543,13 @@ AArch64RegBankSelect::classifyDef(const llvm::MachineInstr &MI) const {
   case TargetOpcode::G_PTRTOINT:
     return getDefRegisterBank(MI);
   case TargetOpcode::G_BITCAST: {
-    if (Size != 32 && Size != 64)
-      return RegisterBankKind::FPR;
-
-    // FIXME: implicit-defs
-
-    return RegisterBankKind::GPROrFPR;
+    LLT DstTy = MRI.getType(MI.getOperand(0).getReg());
+    LLT SrcTy = MRI.getType(MI.getOperand(1).getReg());
+    if (!DstTy.isVector() && DstTy.getSizeInBits() <= 64)
+      return RegisterBankKind::GPR;
+    return RegisterBankKind::FPR;
   }
-  case TargetOpcode::G_CONSTANT:
+  xxxx case TargetOpcode::G_CONSTANT:
     return RegisterBankKind::GPR;
   case TargetOpcode::G_FCONSTANT:
     return RegisterBankKind::FPR;
@@ -326,7 +614,7 @@ AArch64RegBankSelect::classifyDef(const llvm::MachineInstr &MI) const {
     if (SrcTy.isVector())
       return RegisterBankKind::FPR;
     if (any_of(MRI.use_nodbg_instructions(MI.getOperand(0).getReg()),
-               [&](MachineInstr &MI) { return onlyUsesFP(MI, MRI, TRI); }))
+               [&](MachineInstr &MI) { return usesFPR(MI); }))
       return RegisterBankKind::FPR;
     // FIXME
     return RegisterBankKind::GPROrFPR;
@@ -431,7 +719,7 @@ AArch64RegBankSelect::classifyDef(const llvm::MachineInstr &MI) const {
   case TargetOpcode::G_INTRINSIC_LRINT:
   case TargetOpcode::G_INTRINSIC_ROUNDEVEN:
   case TargetOpcode::G_READCYCLECOUNTER:
-
+    return getDefRegisterBank(MI);
     // memory
   case TargetOpcode::G_LOAD:
   case TargetOpcode::G_SEXTLOAD:
@@ -463,7 +751,7 @@ AArch64RegBankSelect::classifyDef(const llvm::MachineInstr &MI) const {
     return classifyAtomicDef(MI);
   case TargetOpcode::G_FENCE:
   case TargetOpcode::G_EXTRACT:
-    return RegisterBankKind::FPR;
+    return classifyExtract(MI);
   case TargetOpcode::G_UNMERGE_VALUES: {
     // FIXME: improve
     LLT SrcTy = MRI.getType(MI.getOperand(MI.getNumOperands() - 1).getReg());
@@ -477,7 +765,7 @@ AArch64RegBankSelect::classifyDef(const llvm::MachineInstr &MI) const {
   case TargetOpcode::G_MERGE_VALUES:
   case TargetOpcode::G_BUILD_VECTOR:
   case TargetOpcode::G_BUILD_VECTOR_TRUNC:
-    return RegisterBankKind::FPR;
+    return classifyBuildVector(MI);
   case TargetOpcode::G_INTRINSIC:
   case TargetOpcode::G_INTRINSIC_W_SIDE_EFFECTS:
   case TargetOpcode::G_INTRINSIC_CONVERGENT:
@@ -538,22 +826,17 @@ AArch64RegBankSelect::classifyDef(const llvm::MachineInstr &MI) const {
       unsigned Size = Ty.getSizeInBits();
     }
     // use G_BITCAST
+
     xxxx
   }
   case AArch64::G_DUP:
     return RegisterBankKind::FPR;
-  default: {
-    MORE->emit([&] {
-      MachineOptimizationRemarkMissed R(DEBUG_TYPE, "gisel-reg-bank-select2",
-                                        MI.getDebugLoc(), /*MMB*/ nullptr);
-
-      std::string MIAsString;
-      raw_string_ostream Stream = raw_string_ostream(MIAsString);
-      MI.print(Stream);
-      R << "failed to classifyDef: " << MIAsString << ".";
-    });
-    return RegisterBankKind::GPR;
-  }
+    default: {
+      reportGISelFailure(const_cast<MachineFunction &>(MF), *TPC, *MORE,
+                         "gisel-aarch64-regbankselect", "failed to classifyDef",
+                         MI);
+      return RegisterBankKind::GPR;
+    }
   }
 }
 
@@ -572,29 +855,11 @@ bool AArch64RegBankSelect::isDomainReassignable(
   }
 }
 
-// FIXME: There will be more
 /// Returns whether \p MI defs FPR bank
 bool AArch64RegBankSelect::defsFPR(const llvm::MachineInstr &MI) const {
-  switch (MI.getOpcode()) {
-  case AArch64::G_DUP:
-  case TargetOpcode::G_SITOFP:
-  case TargetOpcode::G_UITOFP:
-  case TargetOpcode::G_EXTRACT_VECTOR_ELT:
-  case TargetOpcode::G_INSERT_VECTOR_ELT:
-  case TargetOpcode::G_BUILD_VECTOR:
-  case TargetOpcode::G_BUILD_VECTOR_TRUNC:
-  case TargetOpcode::G_STRICT_FADD:
-  case TargetOpcode::G_STRICT_FSUB:
-  case TargetOpcode::G_STRICT_FMUL:
-  case TargetOpcode::G_STRICT_FDIV:
-  case TargetOpcode::G_STRICT_FREM:
-  case TargetOpcode::G_STRICT_FMA:
-  case TargetOpcode::G_STRICT_FSQRT:
-  case TargetOpcode::G_STRICT_FLDEXP:
-    return true;
-  default:
-    break;
-  }
+  if (auto FloatOp = findFloat(MI.getOpcode()))
+    return FloatOp->defs;
+  return false;
 }
 
 /// Returns whether \p MI uses FPR bank
@@ -606,82 +871,20 @@ bool AArch64RegBankSelect::usesFPR(const llvm::MachineInstr &MI) const {
     return any_of(MI.explicit_uses(), [&](const MachineOperand &Op) {
       return Op.isReg() && defsFPR(*MRI.getVRegDef(Op.getReg()));
     });
-  switch (MI.getOpcode()) {
-  case TargetOpcode::G_FCMP:
-  case TargetOpcode::G_LROUND:
-  case TargetOpcode::G_LLROUND:
 
-  case TargetOpcode::G_STRICT_FADD:
-  case TargetOpcode::G_STRICT_FSUB:
-  case TargetOpcode::G_STRICT_FMUL:
-  case TargetOpcode::G_STRICT_FDIV:
-  case TargetOpcode::G_STRICT_FREM:
-  case TargetOpcode::G_STRICT_FMA:
-  case TargetOpcode::G_STRICT_FSQRT:
-  case TargetOpcode::G_STRICT_FLDEXP:
-  case TargetOpcode::G_FPTOSI:
-  case TargetOpcode::G_FPTOUI:
-  case TargetOpcode::G_FPEXT:
-  case TargetOpcode::G_FPTRUNC:
-  case TargetOpcode::G_FABS:
-  case TargetOpcode::G_FCOPYSIGN:
-  case TargetOpcode::G_FCANONICALIZE:
-  case TargetOpcode::G_IS_FPCLASS:
-  case TargetOpcode::G_FMINNUM:
-  case TargetOpcode::G_FMAXNUM:
-  case TargetOpcode::G_FMINNUM_IEEE:
-  case TargetOpcode::G_FMAXNUM_IEEE:
-  case TargetOpcode::G_FMINIMUM:
-  case TargetOpcode::G_FMAXIMUM:
-  case TargetOpcode::G_FADD:
-  case TargetOpcode::G_FSUB:
-  case TargetOpcode::G_FMUL:
-  case TargetOpcode::G_FMA:
-  case TargetOpcode::G_FMAD:
-  case TargetOpcode::G_FDIV:
-  case TargetOpcode::G_FREM:
-  case TargetOpcode::G_FPOW:
-  case TargetOpcode::G_FPOWI:
-  case TargetOpcode::G_FEXP:
-  case TargetOpcode::G_FEXP2:
-  case TargetOpcode::G_FLOG:
-  case TargetOpcode::G_FLOG2:
-  case TargetOpcode::G_FLOG10:
-  case TargetOpcode::G_FLDEXP:
-  case TargetOpcode::G_FFREXP:
-  case TargetOpcode::G_FCEIL:
-  case TargetOpcode::G_FCOS:
-  case TargetOpcode::G_FSIN:
-  case TargetOpcode::G_FSQRT:
-  case TargetOpcode::G_FFLOOR:
-  case TargetOpcode::G_FRINT:
-  case TargetOpcode::G_FNEARBYINT:
-  case TargetOpcode::G_VECREDUCE_SEQ_FADD:
-  case TargetOpcode::G_VECREDUCE_SEQ_FMUL:
-  case TargetOpcode::G_VECREDUCE_FADD:
-  case TargetOpcode::G_VECREDUCE_FMUL:
-  case TargetOpcode::G_VECREDUCE_FMAX:
-  case TargetOpcode::G_VECREDUCE_FMIN:
-  case TargetOpcode::G_VECREDUCE_ADD:
-  case TargetOpcode::G_VECREDUCE_MUL:
-  case TargetOpcode::G_VECREDUCE_AND:
-  case TargetOpcode::G_VECREDUCE_OR:
-  case TargetOpcode::G_VECREDUCE_XOR:
-  case TargetOpcode::G_VECREDUCE_SMAX:
-  case TargetOpcode::G_VECREDUCE_SMIN:
-  case TargetOpcode::G_VECREDUCE_UMAX:
-  case TargetOpcode::G_VECREDUCE_FMAXIMUM:
-  case TargetOpcode::G_VECREDUCE_FMINIMUM:
-  case TargetOpcode::G_VECREDUCE_UMIN:
-  case TargetOpcode::G_INTRINSIC_TRUNC:
-  case TargetOpcode::G_INTRINSIC_ROUND:
-    return true;
-  case TargetOpcode::G_INTRINSIC: {
-    // TODO: Add more intrinsics.
+  if (auto FloatOp = findFloat(MI.getOpcode()))
+    return FloatOp->uses;
+
+  if (MI.getOpcode() == TargetOpcode::G_INTRINSIC) {
+    // TODO: Add more intrinsics. TableGen?
     const MachineRegisterInfo &MRI = MI.getMF()->getRegInfo();
     switch (cast<GIntrinsic>(MI).getIntrinsicID()) {
-    default:
+    default: {
+      reportGISelFailure(const_cast<MachineFunction &>(MF), *TPC, *MORE,
+                         "gisel-aarch64-regbankselect",
+                         "failed to recognize intrinsic", MI);
       return false;
+    }
     case Intrinsic::aarch64_neon_uaddlv:
     case Intrinsic::aarch64_neon_uaddv:
     case Intrinsic::aarch64_neon_umaxv:
@@ -704,14 +907,9 @@ bool AArch64RegBankSelect::usesFPR(const llvm::MachineInstr &MI) const {
              SrcTy.getElementCount().getFixedValue() >= 2;
     }
     }
-  }
-  default:
+  } else {
     return false;
   }
-}
-
-void AArch64RegBankSelect::getAnalysisUsage(AnalysisUsage &AU) const {
-  RegBankSelect::getAnalysisUsage(AU);
 }
 
 bool AArch64RegBankSelect::isUnassignable(const MachineInstr &MI) const {
@@ -725,25 +923,25 @@ bool AArch64RegBankSelect::runOnMachineFunction(MachineFunction &MF) {
           MachineFunctionProperties::Property::FailedISel))
     return false;
 
-  MORE = std::make_unique<MachineOptimizationRemarkEmitter>(MF, MBFI);
+  MORE = std::make_unique<MachineOptimizationRemarkEmitter>(MF, nullptr);
 
   init(MF);
 
   // assign unambiguous in any order
   for (MachineBasicBlock &MBB : MF)
-    for (MachineInstr &mi : reverse(MBB.instrs())) {
-      if (isUnassignable(mi)
-          continue;
+    for (MachineInstr &mi : MBB.instrs()) {
+      if (isUnassignable(mi))
+        continue;
       if (isUnambiguous(mi))
         assignUnambiguousRegisterBank(mi);
     }
 
-  // uses before defs?
+  // uses before defs
   ReversePostOrderTraversal<MachineFunction *> RPOT(&MF);
   for (MachineBasicBlock *MBB : RPOT)
     for (MachineInstr &mi : MBB->instrs()) {
-      if (isUnassignable(mi)
-          continue;
+      if (isUnassignable(mi))
+        continue;
       if (isAmbiguous(mi))
         assignAmbiguousRegisterBank(mi);
     }
@@ -751,15 +949,16 @@ bool AArch64RegBankSelect::runOnMachineFunction(MachineFunction &MF) {
   return true;
 }
 
-INITIALIZE_PASS(AArch64RegBankSelect, DEBUG_TYPE,
-                "AArch64: Assign REgister to RegisterBanks",
-                false, // is CFG only?
-                false  // is analysis?
-)
+// https://reviews.llvm.org/D89415
+
+INITIALIZE_PASS_BEGIN(AArch64RegBankSelect, DEBUG_TYPE, "AArch64 RegBankSelect",
+                      false, false)
+INITIALIZE_PASS_END(AArch64RegBankSelect, DEBUG_TYPE, "AArch64 RegBankSelect",
+                    false, false)
 
 namespace llvm {
 
-llvm::MachineFunctionPass *createAArch64RegBankSelect() {
+FunctionPass *createAArch64RegBankSelect() {
   return new AArch64RegBankSelect();
 }
 
