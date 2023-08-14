@@ -61,21 +61,31 @@ enum RegisterBankKind {
 /// AArch64RegBankSelect::classifyDef and
 /// AArch64RegBankSelect::classifyMemoryDef.
 
-/* GenericOpcodes.td on August 9 2023
+/* GenericOpcodes.td on August 14 2023
  * Please extend.
  *
  * Some Opcodes are ignored, e.g., G_JUMP_TABLE, G_STACKSAVE, G_STACKRESTORE, ..
  */
+
+
+// FIXME: remove
+namespace llvm {
+void initializeAArch64RegBankSelectPass(PassRegistry &Registry);
+}
 
 namespace {
 
 class AArch64RegBankSelect : public llvm::RegBankSelect {
   /// classifiers
   RegisterBankKind classifyDef(const llvm::MachineInstr &) const;
-  RegisterBankKind classifyMemoryDef(const llvm::MachineInstr &MI) const;
-  RegisterBankKind classifyAtomicDef(const llvm::MachineInstr &MI) const;
-  RegisterBankKind classifyIntrinsicDef(const llvm::MachineInstr &MI) const;
   RegisterBankKind getDefRegisterBank(const llvm::MachineInstr &MI) const;
+  /// Classify G_LOAD and G_STORE
+  RegisterBankKind classifyMemoryDef(const llvm::MachineInstr &MI) const;
+  /// Classify G_ATOMIC*
+  RegisterBankKind classifyAtomicDef(const llvm::MachineInstr &MI) const;
+  /// Classify G_INTRINSIC_*
+  RegisterBankKind classifyIntrinsicDef(const llvm::MachineInstr &MI) const;
+  /// Classify G_EXTRACT.
   RegisterBankKind classifyExtract(const llvm::MachineInstr &MI) const;
   /// Classify G_BUILD_VECTOR.
   RegisterBankKind classifyBuildVector(const llvm::MachineInstr &MI) const;
@@ -170,6 +180,7 @@ static constexpr std::array<UseDefBehavior, 20> FloatingPoint = {
     {TargetOpcode::G_FPOWI, true, true},
     {TargetOpcode::G_FEXP, true, true},
     {TargetOpcode::G_FEXP2, true, true},
+    {TargetOpcode::G_FEXP10, true, true},
     {TargetOpcode::G_FLOG, true, true},
     {TargetOpcode::G_FLOG2, true, true},
     {TargetOpcode::G_FLOG10, true, true},
@@ -286,12 +297,14 @@ bool AArch64RegBankSelect::usesFRPRegisterBank(
   return false;
 }
 
+/// Return whether \p MI uses the GPR register bank
 bool AArch64RegBankSelect::usesGPR(const llvm::MachineInstr &MI) const {
   if (auto useDef = findGPR(MI.getOpcode()))
     return useDef->uses;
   return false;
 }
 
+/// Return whether \p MI defs the GPR register bank
 bool AArch64RegBankSelect::defsGPR(const llvm::MachineInstr &MI) const {
   if (auto useDef = findGPR(MI.getOpcode()))
     return useDef->defs;
@@ -337,7 +350,7 @@ AArch64RegBankSelect::classifyBuildVector(const llvm::MachineInstr &MI) const {
   }
 
   if (isFloatingPoint(*DefMI) || SrcTy.getSizeInBits() < 32 ||
-      getRegBank(VReg, MRI, TRI) == &AArch64::FPRRegBank) {
+      MRI.getRegClassOrNull(VReg) == &AArch64::FPRRegBank) {
     return RegisterBankKind::FPR;
   }
 
@@ -431,10 +444,6 @@ AArch64RegBankSelect::classifyAtomicDef(const llvm::MachineInstr &MI) const {
 
 RegisterBankKind
 AArch64RegBankSelect::classifyIntrinsicDef(const llvm::MachineInstr &MI) const {
-  if (!isFloatingPoint(MI))
-    return RegisterBankKind::GPR;
-
-  return RegisterBankKind::FPR;
 }
 
 /// Returns whether instr \p MI is a  floating-point,
