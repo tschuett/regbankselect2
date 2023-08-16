@@ -60,13 +60,13 @@ enum RegisterBankKind {
 /// AArch64RegBankSelect::assignAmbiguousRegisterBank,
 /// AArch64RegBankSelect::classifyDef and
 /// AArch64RegBankSelect::classifyMemoryDef.
-
-/* GenericOpcodes.td on August 14 2023
- * Please extend.
- *
- * Some Opcodes are ignored, e.g., G_JUMP_TABLE, G_STACKSAVE, G_STACKRESTORE, ..
- */
-
+///
+/// GenericOpcodes.td on August 14 2023
+/// Please extend.
+///
+/// Some Opcodes are ignored, e.g., G_JUMP_TABLE, G_STACKSAVE,
+/// G_STACKRESTORE, and ...
+///
 
 // FIXME: remove
 namespace llvm {
@@ -99,6 +99,7 @@ class AArch64RegBankSelect : public llvm::RegBankSelect {
   bool isUnambiguous(const llvm::MachineInstr &) const;
   bool isAmbiguous(const llvm::MachineInstr &) const;
   bool isFloatingPoint(const llvm::MachineInstr &) const;
+  bool isFloatingPointIntrinsic(const llvm::MachineInstr &) const;
   bool usesFRPRegisterBank(const llvm::MachineInstr &MI) const;
   bool isUnassignable(const MachineInstr &MI) const;
 
@@ -140,7 +141,8 @@ struct UseDefBehavior {
 
 // FIXME: sort?
 
-/// List of floating point instructions with their use/def behavior.
+/// List of floating point instructions with their unconditional use/def
+/// behavior.
 static constexpr std::array<UseDefBehavior, 20> FloatingPoint = {
     {TargetOpcode::G_FCMP, true, true}, // maybe
     {TargetOpcode::G_LROUND, true, false},
@@ -216,7 +218,7 @@ static constexpr std::array<UseDefBehavior, 20> FloatingPoint = {
     {TargetOpcode::G_INTRINSIC_ROUNDEVEN, true, true},
     {AArch64::G_DUP, true, true}};
 
-/// List of integer/GPR instructions with their use/def behavior.
+/// List of integer/GPR instructions with their unconditional use/def behavior.
 static constexpr std::array<UseDefBehavior, 20> Integer = {
     {TargetOpcode::G_PTRMASK, true, true},
     {TargetOpcode::G_SDIV, true, true},
@@ -232,6 +234,10 @@ static constexpr std::array<UseDefBehavior, 20> Integer = {
     {TargetOpcode::G_UADDO, true, true},
     {TargetOpcode::G_USUBO, true, true},
     {TargetOpcode::G_FREM, true, true},
+    {TargetOpcode::G_FPTOSI, false, true},
+    {TargetOpcode::G_FPTOUI, false, true},
+    {TargetOpcode::G_SITOFP, true, false},
+    {TargetOpcode::G_UITOFP, true, false},
     {TargetOpcode::G_CONSTANT, true, true},
     {TargetOpcode::G_SEXT_INREG, true, true},
     {TargetOpcode::G_BRCOND, true, true},
@@ -260,6 +266,187 @@ static constexpr std::array<UseDefBehavior, 20> Integer = {
     {TargetOpcode::G_SSUBSAT, true, true},
     {TargetOpcode::G_LROUND, false, true},
     {TargetOpcode::G_LLROUND, false, true}};
+
+/// Advanced SIMD intrinsics from IntrinsicsAArch64.td.
+/// The list is incomplete. 14. July 2023.
+static constexpr std::array<unsigned, 500> FloatIntrinsics = {
+    Intrinsic::aarch64_neon_saddv,
+    Intrinsic::aarch64_neon_uaddv,
+    Intrinsic::aarch64_neon_faddv,
+    Intrinsic::aarch64_neon_saddlv,
+    Intrinsic::aarch64_neon_uaddlv,
+    Intrinsic::aarch64_neon_shadd,
+    Intrinsic::aarch64_neon_uhadd,
+    Intrinsic::aarch64_neon_srhadd,
+    Intrinsic::aarch64_neon_urhadd,
+    Intrinsic::aarch64_neon_sqadd,
+    Intrinsic::aarch64_neon_suqadd,
+    Intrinsic::aarch64_neon_usqadd,
+    Intrinsic::aarch64_neon_uqadd,
+    Intrinsic::aarch64_neon_addhn,
+    Intrinsic::aarch64_neon_raddhn,
+    Intrinsic::aarch64_neon_sqdmulh,
+    Intrinsic::aarch64_neon_sqdmulh_lane,
+    Intrinsic::aarch64_neon_sqdmulh_laneq,
+    Intrinsic::aarch64_neon_sqrdmlah,
+    Intrinsic::aarch64_neon_sqrdmlsh,
+    Intrinsic::aarch64_neon_pmul,
+    Intrinsic::aarch64_neon_smull,
+    Intrinsic::aarch64_neon_umull,
+    Intrinsic::aarch64_neon_pmull,
+    Intrinsic::aarch64_neon_fmulx,
+    Intrinsic::aarch64_neon_sqdmull,
+    Intrinsic::aarch64_neon_shsub,
+    Intrinsic::aarch64_neon_uhsub,
+    Intrinsic::aarch64_neon_sqsub,
+    Intrinsic::aarch64_neon_uhsub,
+    Intrinsic::aarch64_neon_rsubhn,
+    Intrinsic::aarch64_neon_facge,
+    Intrinsic::aarch64_neon_facgt,
+    Intrinsic::aarch64_neon_sabd,
+    Intrinsic::aarch64_neon_uabd,
+    Intrinsic::aarch64_neon_fabd,
+    Intrinsic::aarch64_neon_fabd,
+    Intrinsic::aarch64_neon_smax,
+    Intrinsic::aarch64_neon_umax,
+    Intrinsic::aarch64_neon_fmax,
+    Intrinsic::aarch64_neon_fmaxnmp,
+    Intrinsic::aarch64_neon_smaxv,
+    Intrinsic::aarch64_neon_umaxv,
+    Intrinsic::aarch64_neon_fmaxv,
+    Intrinsic::aarch64_neon_fmaxnmv,
+    Intrinsic::aarch64_neon_smin,
+    Intrinsic::aarch64_neon_umin,
+    Intrinsic::aarch64_neon_fmin,
+    Intrinsic::aarch64_neon_fminnmp,
+    Intrinsic::aarch64_neon_fminnm,
+    Intrinsic::aarch64_neon_fmaxnm,
+    Intrinsic::aarch64_neon_sminv,
+    Intrinsic::aarch64_neon_uminv,
+    Intrinsic::aarch64_neon_fmaxv,
+    Intrinsic::aarch64_neon_fmaxnmv,
+    Intrinsic::aarch64_neon_smin,
+    Intrinsic::aarch64_neon_umin,
+    Intrinsic::aarch64_neon_fmin,
+    Intrinsic::aarch64_neon_fminnmp,
+    Intrinsic::aarch64_neon_fminnm,
+    Intrinsic::aarch64_neon_fmaxnm,
+    Intrinsic::aarch64_neon_sminv,
+    Intrinsic::aarch64_neon_uminv,
+    Intrinsic::aarch64_neon_fminv,
+    Intrinsic::aarch64_neon_fminnmv,
+    Intrinsic::aarch64_neon_addp,
+    Intrinsic::aarch64_neon_faddp,
+    Intrinsic::aarch64_neon_saddlp,
+    Intrinsic::aarch64_neon_uaddlp,
+    Intrinsic::aarch64_neon_smaxp,
+    Intrinsic::aarch64_neon_umaxp,
+    Intrinsic::aarch64_neon_fmaxp,
+    Intrinsic::aarch64_neon_sminp,
+    Intrinsic::aarch64_neon_uminp,
+    Intrinsic::aarch64_neon_fminp,
+    Intrinsic::aarch64_neon_frecps,
+    Intrinsic::aarch64_neon_frsqrts,
+    Intrinsic::aarch64_neon_frecpx,
+    Intrinsic::aarch64_neon_sqshl,
+    Intrinsic::aarch64_neon_uqshl,
+    Intrinsic::aarch64_neon_srshl,
+    Intrinsic::aarch64_neon_urshl,
+    Intrinsic::aarch64_neon_sqrshl,
+    Intrinsic::aarch64_neon_uqrshl,
+    Intrinsic::aarch64_neon_sqshlu,
+    Intrinsic::aarch64_neon_sqshrun,
+    Intrinsic::aarch64_neon_sqrshrun,
+    Intrinsic::aarch64_neon_sqshrn,
+    Intrinsic::aarch64_neon_uqshrn,
+    Intrinsic::aarch64_neon_rshrn,
+    Intrinsic::aarch64_neon_sqrshrn,
+    Intrinsic::aarch64_neon_uqrshrn,
+    Intrinsic::aarch64_neon_sshl,
+    Intrinsic::aarch64_neon_ushl,
+    Intrinsic::aarch64_neon_shll,
+    Intrinsic::aarch64_neon_sshll,
+    Intrinsic::aarch64_neon_ushll,
+    Intrinsic::aarch64_neon_vsri,
+    Intrinsic::aarch64_neon_vsli,
+    Intrinsic::aarch64_neon_sqxtn,
+    Intrinsic::aarch64_neon_uqxtn,
+    Intrinsic::aarch64_neon_sqxtun,
+    Intrinsic::aarch64_neon_abs,
+    Intrinsic::aarch64_neon_sqabs,
+    Intrinsic::aarch64_neon_sqneg,
+    Intrinsic::aarch64_neon_cls,
+    Intrinsic::aarch64_neon_urecpe,
+    Intrinsic::aarch64_neon_frecpe,
+    Intrinsic::aarch64_neon_ursqrte,
+    Intrinsic::aarch64_neon_frsqrte,
+    Intrinsic::aarch64_neon_fcvtas,
+    Intrinsic::aarch64_neon_fcvtau,
+    Intrinsic::aarch64_neon_fcvtms,
+    Intrinsic::aarch64_neon_fcvtmu,
+    Intrinsic::aarch64_neon_fcvtns,
+    Intrinsic::aarch64_neon_fcvtnu,
+    Intrinsic::aarch64_neon_fcvtps,
+    Intrinsic::aarch64_neon_fcvtpu,
+    Intrinsic::aarch64_neon_fcvtzs,
+    Intrinsic::aarch64_neon_fcvtzu,
+    Intrinsic::aarch64_neon_frint32x,
+    Intrinsic::aarch64_neon_frint32z,
+    Intrinsic::aarch64_neon_frint64x,
+    Intrinsic::aarch64_neon_frint64z,
+    Intrinsic::aarch64_neon_fcvtxn,
+    Intrinsic::aarch64_neon_udot,
+    Intrinsic::aarch64_neon_sdot,
+    Intrinsic::aarch64_neon_ummla,
+    Intrinsic::aarch64_neon_smmla,
+    Intrinsic::aarch64_neon_usmmla,
+    Intrinsic::aarch64_neon_usdot,
+    Intrinsic::aarch64_neon_bfmmla,
+    Intrinsic::aarch64_neon_bfmlalb,
+    Intrinsic::aarch64_neon_bfmlalt,
+    Intrinsic::aarch64_neon_bfcvtn,
+    Intrinsic::aarch64_neon_bfcvtn2,
+    Intrinsic::aarch64_neon_fmlal,
+    Intrinsic::aarch64_neon_fmlsl,
+    Intrinsic::aarch64_neon_fmlal2,
+    Intrinsic::aarch64_neon_fmlsl2,
+    Intrinsic::aarch64_neon_vcadd_rot90,
+    Intrinsic::aarch64_neon_vcadd_rot270,
+    Intrinsic::aarch64_neon_vcmla_rot0,
+    Intrinsic::aarch64_neon_vcmla_rot90,
+    Intrinsic::aarch64_neon_vcmla_rot180,
+    Intrinsic::aarch64_neon_vcmla_rot270,
+    Intrinsic::aarch64_neon_vcopy_lane,
+    Intrinsic::aarch64_neon_ld1x2,
+    Intrinsic::aarch64_neon_ld1x3,
+    Intrinsic::aarch64_neon_ld1x4,
+    Intrinsic::aarch64_neon_st1x2,
+    Intrinsic::aarch64_neon_st1x3,
+    Intrinsic::aarch64_neon_st1x4,
+    Intrinsic::aarch64_neon_ld2,
+    Intrinsic::aarch64_neon_ld3,
+    Intrinsic::aarch64_neon_ld4,
+    Intrinsic::aarch64_neon_ld2lane,
+    Intrinsic::aarch64_neon_ld3lane,
+    Intrinsic::aarch64_neon_ld4lane,
+    Intrinsic::aarch64_neon_ld2r,
+    Intrinsic::aarch64_neon_ld3r,
+    Intrinsic::aarch64_neon_ld4r,
+    Intrinsic::aarch64_neon_st2,
+    Intrinsic::aarch64_neon_st3,
+    Intrinsic::aarch64_neon_st4,
+    Intrinsic::aarch64_neon_st2lane,
+    Intrinsic::aarch64_neon_st3lane,
+    Intrinsic::aarch64_neon_st4lane,
+    Intrinsic::aarch64_neon_tbl1,
+    Intrinsic::aarch64_neon_tbl2,
+    Intrinsic::aarch64_neon_tbl3,
+    Intrinsic::aarch64_neon_tbl4,
+    Intrinsic::aarch64_neon_tbx1,
+    Intrinsic::aarch64_neon_tbx2,
+    Intrinsic::aarch64_neon_tbx3,
+    Intrinsic::aarch64_neon_tbx4,
+};
 
 static std::optional<UseDefBehavior> findFloat(unsigned Opcode) {
   // FIXME slow:
@@ -444,11 +631,28 @@ AArch64RegBankSelect::classifyAtomicDef(const llvm::MachineInstr &MI) const {
 
 RegisterBankKind
 AArch64RegBankSelect::classifyIntrinsicDef(const llvm::MachineInstr &MI) const {
+  const MachineFunction &MF = *MI.getParent()->getParent();
+  const MachineRegisterInfo &MRI = MF.getRegInfo();
+
+  if (isFloatingPointIntrinsic(MI))
+    return RegisterBankKind::FPR;
+
+  if (any_of(MRI.use_nodbg_instructions(MI.getOperand(0).getReg()),
+             [&](const MachineInstr &UseMI) {
+               return usesFPR(UseMI) || defsFPR(UseMI);
+             }))
+    return RegisterBankKind::FPR;
+
+// FIXME
+//  LLT DestTy = MRI.getType(MI.getOperand(0).getReg());
+//  if (DestTy.getScalarSizeInBits() >
 }
 
 /// Returns whether instr \p MI is a  floating-point,
 /// having only floating-point operands.
 bool AArch64RegBankSelect::isFloatingPoint(const llvm::MachineInstr &MI) const {
+  if (isFloatingPointIntrinsic(MI))
+    return true;
   if (auto FloatOp = findFloat(MI.getOpcode()))
     return FloatOp->uses && FloatOp->defs;
   return false;
@@ -467,6 +671,44 @@ AArch64RegBankSelect::getDefRegisterBank(const llvm::MachineInstr &MI) const {
   if (IsFPR)
     return RegisterBankKind::FPR;
   return RegisterBankKind::GPR;
+}
+
+/// \returns true if a given intrinsic only uses and defines FPRs.
+bool AArch64RegBankSelect::isFloatingPointIntrinsic(
+    const llvm::MachineInstr &MI) const {
+  const MachineFunction &MF = *MI.getParent()->getParent();
+  const MachineRegisterInfo &MRI = MF.getRegInfo();
+  // TODO: Add more intrinsics. TableGen?
+
+  for (auto Intrin : FloatIntrinsics)
+    if (Intrin == cast<GIntrinsic>(MI).getIntrinsicID())
+      return true;
+
+  switch (cast<GIntrinsic>(MI).getIntrinsicID()) {
+  default:
+    return false;
+  case Intrinsic::aarch64_neon_uaddlv:
+  case Intrinsic::aarch64_neon_uaddv:
+  case Intrinsic::aarch64_neon_umaxv:
+  case Intrinsic::aarch64_neon_uminv:
+  case Intrinsic::aarch64_neon_fmaxv:
+  case Intrinsic::aarch64_neon_fminv:
+  case Intrinsic::aarch64_neon_fmaxnmv:
+  case Intrinsic::aarch64_neon_fminnmv:
+    return true;
+  case Intrinsic::aarch64_neon_saddlv: {
+    const LLT SrcTy = MRI.getType(MI.getOperand(2).getReg());
+    return SrcTy.getElementType().getSizeInBits() >= 16 &&
+           SrcTy.getElementCount().getFixedValue() >= 4;
+  }
+  case Intrinsic::aarch64_neon_saddv:
+  case Intrinsic::aarch64_neon_smaxv:
+  case Intrinsic::aarch64_neon_sminv: {
+    const LLT SrcTy = MRI.getType(MI.getOperand(2).getReg());
+    return SrcTy.getElementType().getSizeInBits() >= 32 &&
+           SrcTy.getElementCount().getFixedValue() >= 2;
+  }
+  }
 }
 
 /// Assing \p MI to the FPR register bank
@@ -553,12 +795,11 @@ AArch64RegBankSelect::classifyDef(const llvm::MachineInstr &MI) const {
     return getDefRegisterBank(MI);
   case TargetOpcode::G_BITCAST: {
     LLT DstTy = MRI.getType(MI.getOperand(0).getReg());
-    LLT SrcTy = MRI.getType(MI.getOperand(1).getReg());
     if (!DstTy.isVector() && DstTy.getSizeInBits() <= 64)
       return RegisterBankKind::GPR;
     return RegisterBankKind::FPR;
   }
-  xxxx case TargetOpcode::G_CONSTANT:
+  case TargetOpcode::G_CONSTANT:
     return RegisterBankKind::GPR;
   case TargetOpcode::G_FCONSTANT:
     return RegisterBankKind::FPR;
@@ -840,12 +1081,12 @@ AArch64RegBankSelect::classifyDef(const llvm::MachineInstr &MI) const {
   }
   case AArch64::G_DUP:
     return RegisterBankKind::FPR;
-    default: {
-      reportGISelFailure(const_cast<MachineFunction &>(MF), *TPC, *MORE,
-                         "gisel-aarch64-regbankselect", "failed to classifyDef",
-                         MI);
-      return RegisterBankKind::GPR;
-    }
+  default: {
+    reportGISelFailure(const_cast<MachineFunction &>(MF), *TPC, *MORE,
+                       "gisel-aarch64-regbankselect", "failed to classifyDef",
+                       MI);
+    return RegisterBankKind::GPR;
+  }
   }
 }
 
@@ -885,37 +1126,7 @@ bool AArch64RegBankSelect::usesFPR(const llvm::MachineInstr &MI) const {
     return FloatOp->uses;
 
   if (MI.getOpcode() == TargetOpcode::G_INTRINSIC) {
-    // TODO: Add more intrinsics. TableGen?
-    const MachineRegisterInfo &MRI = MI.getMF()->getRegInfo();
-    switch (cast<GIntrinsic>(MI).getIntrinsicID()) {
-    default: {
-      reportGISelFailure(const_cast<MachineFunction &>(MF), *TPC, *MORE,
-                         "gisel-aarch64-regbankselect",
-                         "failed to recognize intrinsic", MI);
-      return false;
-    }
-    case Intrinsic::aarch64_neon_uaddlv:
-    case Intrinsic::aarch64_neon_uaddv:
-    case Intrinsic::aarch64_neon_umaxv:
-    case Intrinsic::aarch64_neon_uminv:
-    case Intrinsic::aarch64_neon_fmaxv:
-    case Intrinsic::aarch64_neon_fminv:
-    case Intrinsic::aarch64_neon_fmaxnmv:
-    case Intrinsic::aarch64_neon_fminnmv:
-      return true;
-    case Intrinsic::aarch64_neon_saddlv: {
-      const LLT SrcTy = MRI.getType(MI.getOperand(2).getReg());
-      return SrcTy.getElementType().getSizeInBits() >= 16 &&
-             SrcTy.getElementCount().getFixedValue() >= 4;
-    }
-    case Intrinsic::aarch64_neon_saddv:
-    case Intrinsic::aarch64_neon_smaxv:
-    case Intrinsic::aarch64_neon_sminv: {
-      const LLT SrcTy = MRI.getType(MI.getOperand(2).getReg());
-      return SrcTy.getElementType().getSizeInBits() >= 32 &&
-             SrcTy.getElementCount().getFixedValue() >= 2;
-    }
-    }
+    return isFloatingPointIntrinsic(MI);
   } else {
     return false;
   }
