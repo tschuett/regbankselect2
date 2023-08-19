@@ -11,11 +11,9 @@ list(APPEND CMAKE_MODULE_PATH "${LLVM_DIR}")
 
 find_package(LLVM REQUIRED CONFIG)
 
-message(STATUS "Using Cmake LLVM in: ${LLVM_DIR}")
+message(STATUS "Using CMake LLVM in: ${LLVM_DIR}")
 
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
-
-#option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
 
 include(AddLLVM)
 include(HandleLLVMOptions)
