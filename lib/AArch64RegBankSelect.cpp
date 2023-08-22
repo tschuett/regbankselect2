@@ -65,7 +65,7 @@ enum RegisterBankKind {
 ///
 /// The most important methods are
 /// AArch64RegBankSelect::assignAmbiguousRegisterBank,
-/// AArch64RegBankSelect::classifyDef and
+/// AArch64RegBankSelect::classifyDef, and
 /// AArch64RegBankSelect::classifyMemoryDef.
 ///
 /// GenericOpcodes.td on August 14 2023
@@ -77,7 +77,7 @@ enum RegisterBankKind {
 ///
 class AArch64RegBankSelect : public llvm::RegBankSelect {
   /// classifiers
-  RegisterBankKind classifyDef(const llvm::MachineInstr &) const;
+  RegisterBankKind classifyDef(const llvm::MachineInstr &MI) const;
   /// Generic classifier. It does not know the G_ .
   RegisterBankKind getDefRegisterBank(const llvm::MachineInstr &MI) const;
   /// Classify G_LOAD and G_STORE
@@ -94,22 +94,22 @@ class AArch64RegBankSelect : public llvm::RegBankSelect {
   RegisterBankKind classifyCopy(const llvm::MachineInstr &MI) const;
 
   /// predicates
-  bool isDomainReassignable(const llvm::MachineInstr &) const;
-  bool usesFPR(const llvm::MachineInstr &) const;
-  bool defsFPR(const llvm::MachineInstr &) const;
-  bool usesGPR(const llvm::MachineInstr &) const;
-  bool defsGPR(const llvm::MachineInstr &) const;
-  bool isUnambiguous(const llvm::MachineInstr &) const;
-  bool isAmbiguous(const llvm::MachineInstr &) const;
-  bool isFloatingPoint(const llvm::MachineInstr &) const;
-  bool isFloatingPointIntrinsic(const llvm::MachineInstr &) const;
+  bool isDomainReassignable(const llvm::MachineInstr &MI) const;
+  bool usesFPR(const llvm::MachineInstr &MI) const;
+  bool defsFPR(const llvm::MachineInstr &MI) const;
+  bool usesGPR(const llvm::MachineInstr &MI) const;
+  bool defsGPR(const llvm::MachineInstr &MI) const;
+  bool isUnambiguous(const llvm::MachineInstr &MI) const;
+  bool isAmbiguous(const llvm::MachineInstr &MI) const;
+  bool isFloatingPoint(const llvm::MachineInstr &MI) const;
+  bool isFloatingPointIntrinsic(const llvm::MachineInstr &MI) const;
   bool usesFPRRegisterBank(const llvm::MachineInstr &MI) const;
   bool usesGPRRegisterBank(const llvm::MachineInstr &MI) const;
   bool isUnassignable(const MachineInstr &MI) const;
 
   /// assign MIs to register banks
-  void assignAmbiguousRegisterBank(const llvm::MachineInstr &);
-  void assignUnambiguousRegisterBank(const llvm::MachineInstr &);
+  void assignAmbiguousRegisterBank(const llvm::MachineInstr &MI);
+  void assignUnambiguousRegisterBank(const llvm::MachineInstr &MI);
   void assignFPR(const llvm::MachineInstr &MI);
   void assignGPR(const llvm::MachineInstr &MI);
 
@@ -373,7 +373,7 @@ static std::optional<UseDefBehavior> findGPR(unsigned Opcode) {
 }
 
 AArch64RegBankSelect::AArch64RegBankSelect()
-    : RegBankSelect(AArch64RegBankSelect::ID, Mode::Fast) {}
+  : RegBankSelect(AArch64RegBankSelect::ID, Mode::Fast) {}
 
 char AArch64RegBankSelect::ID = 0;
 
@@ -382,8 +382,6 @@ bool AArch64RegBankSelect::usesFPRRegisterBank(
     const llvm::MachineInstr &MI) const {
   const MachineFunction &MF = *MI.getParent()->getParent();
   const MachineRegisterInfo &MRI = MF.getRegInfo();
-  const TargetSubtargetInfo &STI = MF.getSubtarget();
-  const TargetRegisterInfo &TRI = *STI.getRegisterInfo();
 
   // Check if we already know the register bank.
   auto *RB = MRI.getRegBankOrNull(MI.getOperand(0).getReg());
@@ -392,13 +390,11 @@ bool AArch64RegBankSelect::usesFPRRegisterBank(
   return false;
 }
 
-/// Returns true when \p MI uses the GPRR register bank.
+/// Returns true when \p MI uses the GPR register bank.
 bool AArch64RegBankSelect::usesGPRRegisterBank(
     const llvm::MachineInstr &MI) const {
   const MachineFunction &MF = *MI.getParent()->getParent();
   const MachineRegisterInfo &MRI = MF.getRegInfo();
-  const TargetSubtargetInfo &STI = MF.getSubtarget();
-  const TargetRegisterInfo &TRI = *STI.getRegisterInfo();
 
   // Check if we already know the register bank.
   auto *RB = MRI.getRegBankOrNull(MI.getOperand(0).getReg());
@@ -440,6 +436,7 @@ RegisterBankKind
 AArch64RegBankSelect::classifyBuildVector(const llvm::MachineInstr &MI) const {
   const MachineFunction &MF = *MI.getParent()->getParent();
   const MachineRegisterInfo &MRI = MF.getRegInfo();
+
   Register Src = MI.getOperand(1).getReg();
 
   if (MRI.getRegClassOrNull(Src) != &AArch64::PMI_FirstGPR)
@@ -455,14 +452,12 @@ AArch64RegBankSelect::classifyBuildVector(const llvm::MachineInstr &MI) const {
   if (all_of(MI.operands(), [&](const MachineOperand &Op) {
         return Op.isDef() || MRI.getVRegDef(Op.getReg())->getOpcode() ==
                                  TargetOpcode::G_CONSTANT;
-      })) {
+      }))
     return RegisterBankKind::GPR;
-  }
 
   if (isFloatingPoint(*DefMI) || SrcTy.getSizeInBits() < 32 ||
-      MRI.getRegClassOrNull(VReg) == &AArch64::FPRRegBank) {
+      MRI.getRegClassOrNull(VReg) == &AArch64::FPRRegBank)
     return RegisterBankKind::FPR;
-  }
 
   return RegisterBankKind::FPR; // FIXME
 }
@@ -534,11 +529,27 @@ AArch64RegBankSelect::classifyMemoryDef(const llvm::MachineInstr &MI) const {
       return RegisterBankKind::GPR;
   }
 
-  if (auto *St = dyn_cast<GStore>(&MI)) {
+  if (isa<GStore>(&MI)) {
+    // Is payload used or def'd from GPR?
+    if (any_of(MRI.use_nodbg_instructions(MI.getOperand(0).getReg()),
+               [&](const MachineInstr &UseMI) {
+                 return usesGPR(UseMI) || defsGPR(UseMI);
+               }))
+      return RegisterBankKind::GPR;
+
+    // Is payload used or def'd from FPR?
+    if (any_of(MRI.use_nodbg_instructions(MI.getOperand(0).getReg()),
+               [&](const MachineInstr &UseMI) {
+                 return usesFPR(UseMI) || defsFPR(UseMI);
+               }))
+      return RegisterBankKind::FPR;
+
+    // Is the bank already set?
     Register Dst = MI.getOperand(0).getReg();
 
-    if (MRI.getRegClassOrNull(Dst) == &AArch64::PMI_FirstGPR) {
-    }
+    if (MRI.getRegClassOrNull(Dst) == &AArch64::PMI_FirstGPR)
+      return RegisterBankKind::GPR;
+
     return RegisterBankKind::FPR;
   }
 
@@ -612,7 +623,7 @@ AArch64RegBankSelect::classifyIntrinsicDef(const llvm::MachineInstr &MI) const {
   if (DestTy.getScalarSizeInBits() > 64)
     return RegisterBankKind::FPR;
 
-  // last resort
+  // last resort unknown
   return RegisterBankKind::GPROrFPR;
 }
 
@@ -1036,7 +1047,7 @@ AArch64RegBankSelect::classifyDef(const llvm::MachineInstr &MI) const {
   case TargetOpcode::G_MEMSET:
   case TargetOpcode::G_BZERO:
     return RegisterBankKind::GPR;
-    // bit field extraction
+  // bit field extraction
   case TargetOpcode::G_SBFX:
   case TargetOpcode::G_UBFX: {
     if (Ty.isVector())
@@ -1091,11 +1102,9 @@ bool AArch64RegBankSelect::usesFPR(const llvm::MachineInstr &MI) const {
   if (auto FloatOp = findFloat(MI.getOpcode()))
     return FloatOp->uses;
 
-  if (MI.getOpcode() == TargetOpcode::G_INTRINSIC) {
+  if (MI.getOpcode() == TargetOpcode::G_INTRINSIC)
     return isFloatingPointIntrinsic(MI);
-  } else {
-    return false;
-  }
+  return false;
 }
 
 bool AArch64RegBankSelect::isUnassignable(const MachineInstr &MI) const {
@@ -1137,10 +1146,8 @@ bool AArch64RegBankSelect::runOnMachineFunction(MachineFunction &MF) {
 
 // https://reviews.llvm.org/D89415
 
-INITIALIZE_PASS_BEGIN(AArch64RegBankSelect, DEBUG_TYPE, "AArch64 RegBankSelect",
-                      false, false)
-INITIALIZE_PASS_END(AArch64RegBankSelect, DEBUG_TYPE, "AArch64 RegBankSelect",
-                    false, false)
+INITIALIZE_PASS(AArch64RegBankSelect, DEBUG_TYPE, "AArch64 RegBankSelect",
+                false, false)
 
 namespace llvm {
 
